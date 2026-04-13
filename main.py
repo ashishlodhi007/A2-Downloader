@@ -2,7 +2,16 @@ from flask import Flask, render_template_string, request, jsonify, send_file
 from pytubefix import YouTube
 import os, uuid, subprocess, threading
 from concurrent.futures import ThreadPoolExecutor
+import os
+import time
 
+def wait_for_file(path, timeout=30):
+    start = time.time()
+    while not os.path.exists(path):
+        if time.time() - start > timeout:
+            return False
+        time.sleep(1)
+    return True
 app = Flask(__name__)
 
 # ================= CONFIG =================
@@ -38,13 +47,29 @@ def info():
         return jsonify({"error": str(e)})
 
 # ================= FILE DOWNLOAD =================
+@app.route("/download")
+def download():
+    url = request.args.get("url")
+
+    yt = YouTube(url)
+    stream = yt.streams.get_highest_resolution()
+
+    file_path = stream.download(output_path="downloads")
+
+    return send_file(file_path, as_attachment=True)
+
 @app.route("/file/<uid>")
 def file(uid):
     path = files.get(uid)
-    if not path or not os.path.exists(path):
-        return "File not ready", 404
-    return send_file(path, as_attachment=True)
 
+    if not path:
+        return "Invalid file", 404
+
+    # 👇 WAIT until file is actually created (MAIN FIX)
+    if not wait_for_file(path, timeout=60):
+        return "File not ready, try again", 404
+
+    return send_file(path, as_attachment=True)
 # ================= DOWNLOAD ENGINE =================
 def download_task(url, uid, mode):
     try:
@@ -151,7 +176,7 @@ def get_progress(uid):
         })
 
 # ================= UI =================
-HTML = HTML = '''
+HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
