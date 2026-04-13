@@ -1,22 +1,12 @@
 from flask import Flask, render_template_string, request, jsonify, send_file
 from pytubefix import YouTube
-import os, uuid, subprocess, threading
+import os, uuid, subprocess, threading, time, tempfile
 from concurrent.futures import ThreadPoolExecutor
-import os
-import time
 
-def wait_for_file(path, timeout=30):
-    start = time.time()
-    while not os.path.exists(path):
-        if time.time() - start > timeout:
-            return False
-        time.sleep(1)
-    return True
 app = Flask(__name__)
 
 # ================= CONFIG =================
-DOWNLOAD_PATH = "downloads"
-os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+DOWNLOAD_PATH = tempfile.gettempdir()
 
 executor = ThreadPoolExecutor(max_workers=6)
 lock = threading.Lock()
@@ -24,40 +14,33 @@ lock = threading.Lock()
 files = {}
 progress = {}
 status = {}
-titles = {}
 
-# ================= STATE =================
+# ================= UTIL =================
+def wait_for_file(path, timeout=30):
+    start = time.time()
+    while not os.path.exists(path):
+        if time.time() - start > timeout:
+            return False
+        time.sleep(1)
+    return True
+
 def set_state(uid, p, s=None):
     with lock:
         progress[uid] = p
         if s:
             status[uid] = s
 
-# ================= INFO =================
-@app.route("/info", methods=["POST"])
-def info():
-    url = request.json["url"]
-    try:
-        yt = YouTube(url)
-        return jsonify({
-            "title": yt.title,
-            "thumbnail": yt.thumbnail_url
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+def clean_temp():
+    now = time.time()
+    for f in os.listdir(DOWNLOAD_PATH):
+        path = os.path.join(DOWNLOAD_PATH, f)
+        if os.path.isfile(path) and now - os.path.getmtime(path) > 300:
+            try:
+                os.remove(path)
+            except:
+                pass
 
-# ================= FILE DOWNLOAD =================
-@app.route("/download")
-def download():
-    url = request.args.get("url")
-
-    yt = YouTube(url)
-    stream = yt.streams.get_highest_resolution()
-
-    file_path = stream.download(output_path="downloads")
-
-    return send_file(file_path, as_attachment=True)
-
+# ================= FILE SERVE =================
 @app.route("/file/<uid>")
 def file(uid):
     path = files.get(uid)
@@ -65,31 +48,46 @@ def file(uid):
     if not path:
         return "Invalid file", 404
 
-    # 👇 WAIT until file is actually created (MAIN FIX)
     if not wait_for_file(path, timeout=60):
-        return "File not ready, try again", 404
+        return "File not ready", 404
 
-    return send_file(path, as_attachment=True)
+    response = send_file(path, as_attachment=True)
+
+    @response.call_on_close
+    def cleanup():
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+
+            for ext in ["_v.mp4", "_a.mp4"]:
+                temp_file = os.path.join(DOWNLOAD_PATH, uid + ext)
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+            files.pop(uid, None)
+            progress.pop(uid, None)
+            status.pop(uid, None)
+
+        except Exception as e:
+            print("Cleanup error:", e)
+
+    return response
+
 # ================= DOWNLOAD ENGINE =================
 def download_task(url, uid, mode):
     try:
         yt = YouTube(url)
 
-        safe_title = "".join(c for c in yt.title if c not in r'\/:*?"<>|')
-        titles[uid] = safe_title
-
         set_state(uid, 5, "fetching")
 
-        # ================= MP3 =================
+        # MP3
         if mode == "mp3":
-            set_state(uid, 20, "audio")
-
             audio = yt.streams.filter(only_audio=True)\
                 .order_by("abr").desc().first()
 
             a_path = audio.download(DOWNLOAD_PATH, filename=f"{uid}_a.mp4")
 
-            out_path = os.path.join(DOWNLOAD_PATH, f"{safe_title}.mp3")
+            out_path = os.path.join(DOWNLOAD_PATH, f"{uid}.mp3")
 
             set_state(uid, 60, "converting")
 
@@ -106,32 +104,28 @@ def download_task(url, uid, mode):
             set_state(uid, 100, "done")
             return
 
-        # ================= VIDEO =================
-        set_state(uid, 10, "quality")
-
+        # VIDEO
         target = f"{mode}p"
 
-        video = yt.streams.filter(adaptive=True, only_video=True)\
-            .order_by("resolution").desc().first()
-
-        exact = yt.streams.filter(adaptive=True, only_video=True, res=target).first()
-        if exact:
-            video = exact
+        video = yt.streams.filter(adaptive=True, only_video=True, res=target).first()
+        if not video:
+            video = yt.streams.filter(adaptive=True, only_video=True)\
+                .order_by("resolution").desc().first()
 
         set_state(uid, 30, "video")
 
         v_path = video.download(DOWNLOAD_PATH, filename=f"{uid}_v.mp4")
 
-        set_state(uid, 60, "audio")
-
         audio = yt.streams.filter(only_audio=True)\
             .order_by("abr").desc().first()
+
+        set_state(uid, 60, "audio")
 
         a_path = audio.download(DOWNLOAD_PATH, filename=f"{uid}_a.mp4")
 
         set_state(uid, 80, "merging")
 
-        out_path = os.path.join(DOWNLOAD_PATH, f"{safe_title}.mp4")
+        out_path = os.path.join(DOWNLOAD_PATH, f"{uid}.mp4")
 
         subprocess.run([
             "ffmpeg", "-y",
@@ -154,6 +148,8 @@ def download_task(url, uid, mode):
 # ================= START =================
 @app.route("/start", methods=["POST"])
 def start():
+    clean_temp()
+
     data = request.json
     url = data["url"]
     mode = data.get("mode", "720")
@@ -176,7 +172,7 @@ def get_progress(uid):
         })
 
 # ================= UI =================
-HTML = '''
+HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -207,25 +203,20 @@ input, select{
     display:block;
     width:85%;
     padding:12px;
-    margin:10px auto; /* CENTER FIX */
+    margin:10px auto;
     border-radius:8px;
     border:1px solid #1f2937;
     background:#020617;
     color:#e5e7eb;
-    font-size:14px;
 }
 
 button{
     border:none;
     border-radius:8px;
     padding:10px;
-    font-size:14px;
-    font-weight:500;
     cursor:pointer;
-    transition:0.2s;
 }
 
-/* Centered Preview Button */
 .preview-btn{
     display:block;
     width:85%;
@@ -234,34 +225,10 @@ button{
     color:white;
 }
 
-.preview-btn:hover{
-    background:#1d4ed8;
-}
+.mp4{background:#16a34a;color:white;}
+.mp3{background:#f59e0b;color:black;}
 
-/* Buttons */
-.mp4{
-    background:#16a34a;
-    color:white;
-}
-
-.mp4:hover{
-    background:#15803d;
-}
-
-.mp3{
-    background:#f59e0b;
-    color:black;
-}
-
-.mp3:hover{
-    background:#d97706;
-}
-
-/* Preview Section */
-.preview{
-    display:none;
-    margin-top:18px;
-}
+.preview{display:none;margin-top:18px;}
 
 iframe{
     width:100%;
@@ -274,38 +241,21 @@ iframe{
     height:6px;
     background:#020617;
     border-radius:6px;
-    overflow:hidden;
 }
 
 .progress{
     height:100%;
     width:0%;
     background:#22c55e;
-    transition:0.3s;
-}
-
-#title{
-    margin-top:10px;
-    font-size:13px;
-    text-align:center;
-    color:#9ca3af;
 }
 </style>
-
 </head>
 
 <body>
 
 <div class="card">
 
-<div style="text-align:center; margin-bottom:18px;">
-    <h1 style="margin:0; font-size:20px; font-weight:600;">
-        A2 DOWNLOADER
-    </h1>
-    <p style="margin:4px 0 0; font-size:13px; color:#9ca3af;">
-        Made by Ashish
-    </p>
-</div>
+<h2 style="text-align:center;">A2 Downloader</h2>
 
 <input id="url" placeholder="Paste YouTube link">
 
@@ -313,34 +263,24 @@ iframe{
 
 <select id="videoQuality">
 <option value="360">360p</option>
-<option value="480">480p</option>
-<option value="720">720p</option>
+<option value="720" selected>720p</option>
 <option value="1080">1080p</option>
-<option value="1440" selected>2K</option>
+<option value="1440">2K</option>
 <option value="2160">4K</option>
-<option value="4320">8K</option>
 </select>
 
 <div class="preview" id="preview">
-
-<div style="border-radius:10px; overflow:hidden;">
-    <iframe id="frame"></iframe>
-</div>
+<iframe id="frame"></iframe>
 
 <div id="title">Ready</div>
 
 <div class="progress-box">
-    <div class="progress" id="bar"></div>
+<div class="progress" id="bar"></div>
 </div>
 
-<div style="display:flex; gap:14px; margin-top:18px;">
-    <button class="mp4" onclick="downloadVideo('mp4')" style="flex:1;">
-        Download MP4
-    </button>
-
-    <button class="mp3" onclick="downloadVideo('mp3')" style="flex:1;">
-        Download MP3
-    </button>
+<div style="display:flex;gap:10px;margin-top:10px;">
+<button class="mp4" onclick="downloadVideo('mp4')" style="flex:1;">MP4</button>
+<button class="mp3" onclick="downloadVideo('mp3')" style="flex:1;">MP3</button>
 </div>
 
 </div>
@@ -349,75 +289,58 @@ iframe{
 
 <script>
 
-let videoURL = "";
+let videoURL="";
 
 function getVideoID(url){
-    let m = url.match(/(?:v=|youtu\\.be\\/|\\/)([0-9A-Za-z_-]{11})/);
-    return m ? m[1] : null;
+let m=url.match(/(?:v=|youtu\\.be\\/|\\/)([0-9A-Za-z_-]{11})/);
+return m?m[1]:null;
 }
 
 function loadVideo(){
-    let url = document.getElementById("url").value;
-    let id = getVideoID(url);
+let url=document.getElementById("url").value;
+let id=getVideoID(url);
 
-    if(!id){
-        alert("Invalid link");
-        return;
-    }
+if(!id){alert("Invalid link");return;}
 
-    videoURL = url;
-
-    document.getElementById("preview").style.display = "block";
-    document.getElementById("frame").src =
-        "https://www.youtube.com/embed/" + id;
-
-    document.getElementById("title").innerText = "Video loaded";
+videoURL=url;
+document.getElementById("preview").style.display="block";
+document.getElementById("frame").src="https://www.youtube.com/embed/"+id;
 }
 
 function downloadVideo(type){
 
-    if(!videoURL){
-        alert("Load video first");
-        return;
-    }
+fetch("/start",{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({
+url:videoURL,
+mode:type==="mp3"?"mp3":document.getElementById("videoQuality").value
+})
+})
+.then(r=>r.json())
+.then(d=>{
 
-    fetch("/start",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-            url:videoURL,
-            mode: type === "mp3"
-                ? "mp3"
-                : document.getElementById("videoQuality").value
-        })
-    })
-    .then(r => r.json())
-    .then(d => {
+let id=d.id;
 
-        let id = d.id;
+let t=setInterval(()=>{
 
-        let t = setInterval(() => {
+fetch("/progress/"+id)
+.then(r=>r.json())
+.then(p=>{
 
-            fetch("/progress/" + id)
-            .then(r => r.json())
-            .then(p => {
+document.getElementById("title").innerText=p.status+" "+p.progress+"%";
+document.getElementById("bar").style.width=p.progress+"%";
 
-                document.getElementById("title").innerText =
-                    p.status + " • " + p.progress + "%";
+if(p.progress>=100){
+clearInterval(t);
+window.location="/file/"+id;
+}
 
-                document.getElementById("bar").style.width =
-                    p.progress + "%";
+});
 
-                if(p.progress >= 100){
-                    clearInterval(t);
-                    window.location = "/file/" + id;
-                }
+},1000);
 
-            });
-
-        }, 1000);
-
-    });
+});
 
 }
 
@@ -425,7 +348,8 @@ function downloadVideo(type){
 
 </body>
 </html>
-'''
+"""
+
 @app.route("/")
 def home():
     return render_template_string(HTML)
